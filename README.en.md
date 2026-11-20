@@ -4,6 +4,8 @@
 
 **Make desktop software work for people.**
 
+**FxxK** stands for **Freedom · eXploration · eXpertise · Knowledge**. **Desk** is where we put those values into practice: giving users more choice, turning exploration into useful tools, and applying shared knowledge and engineering expertise to everyday work.
+
 FxxK-Desk explores automation for desktop applications with limited APIs or integration options. Our goal is to give users more control over their own workflows through visual understanding and desktop interaction.
 
 ## What we want to build
