@@ -25,7 +25,15 @@ Keep the core independent of application adapters, process data locally by defau
 
 ## Status
 
-Early exploration; no runnable implementation yet. The first milestone is to identify a target window, capture and recognize its contents, and complete a small workflow with a verifiable result.
+An initial Python scaffold provides window discovery, application launch and focus, screenshot capture, and a configurable vision gateway client. See the [development guide](docs/development.md) for setup. End-to-end visual recognition and action verification still require desktop validation.
+
+An experimental chat and relay workflow adds configured navigation, visible-message collection, SQLite observations, and one-way summaries with sender attribution. The standalone program has completed one desktop relay test; continuous operation and broader message coverage still require validation.
+
+The [burst-recovery design](docs/backfill-design.md) adds ordered anchors, overlapping scroll recovery, explicit gaps, a separate summary worker, and durable queues. Tests cover a simulated 1,000-message burst and eight real multiline test messages; sustained high-volume operation still requires validation.
+
+In one desktop A/B run on the same eight messages, calibrated batch scrolling reduced captures from 122 to 75 and elapsed time from 66.1 to 56.1 seconds, with no missing or duplicate test messages. Results depend on the client and machine load.
+
+[Human takeover](docs/human-takeover.md) pauses desktop input during user activity and requires fresh observation before resuming. Interrupted sends preserve drafts or remain uncertain rather than being retried blindly. A native input self-test and a real-window scrolling check passed; long-term desktop sharing still requires validation.
 
 Experiments should use accounts and environments owned by the user or used with permission. Compatibility and platform acceptance must be evaluated; undetectability and freedom from account restrictions are not guaranteed.
 

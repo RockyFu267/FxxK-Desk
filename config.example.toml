@@ -1,0 +1,37 @@
+# Copy to config.local.toml; local configuration is ignored by Git.
+[targets.example]
+adapter = "desktop_chat"
+executable = 'D:\Apps\Chat\Chat.exe'
+window_title = "Chat"
+chat = "Example Group"
+search_hotkey = "^f"
+timeout_seconds = 20
+auto_reply = false
+# Physical pixels relative to visible window; recalibrate for your own layout.
+layout_width = 1300
+layout_height = 1160
+message_rect = [400, 64, 1130, 900]
+editor_rect = [418, 940, 1120, 1100]
+send_point = [1090, 1123]
+backfill_enabled = true
+backfill_max_pages = 30
+backfill_max_seconds = 45
+anchor_messages = 3
+scroll_notches = 3
+scroll_mode = "batch" # "stepwise" keeps per-event verification for diagnostics.
+scroll_batch_events = 2 # Conservative cap for clients with accelerated scrolling.
+human_idle_seconds = 5
+resume_requires_target_foreground = true
+
+[targets.destination]
+adapter = "desktop_chat"
+executable = 'D:\Apps\Chat\Chat.exe'
+window_title = "Chat"
+chat = "Destination Group"
+
+[relays.example_relay]
+source = "example"
+destination = "destination"
+webhook_env = "SOURCE_WEBHOOK_URL"
+auto_send = false
+max_pending = 10000
