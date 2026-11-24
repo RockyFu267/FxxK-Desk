@@ -13,6 +13,10 @@ class DesktopUnavailable(UserInterference):
     """The Windows input desktop is unavailable (for example an RDP pause)."""
 
 
+class ActionDeferred(UserInterference):
+    """Observation may continue, but shared mouse/keyboard are currently busy."""
+
+
 class InputArbiter:
     def __init__(self, idle_seconds=5, own_tag=None, clock=time.monotonic, initial_idle=float('inf')):
         self.idle_seconds = idle_seconds
@@ -28,17 +32,49 @@ class InputArbiter:
         self.events = deque(maxlen=128)
         self._last_pointer = None
         self.duplicate_pointer_notifications = 0
+        self.region = None
+        self.last_external_input = self.last_human
+        self.outside_events = 0
+        self.automation_priority = False
+
+    def set_region(self, bounds):
+        with self.lock:
+            self.region = tuple(bounds)
+            self.last_human = float('-inf')
+
+    def action_ready(self):
+        with self.lock:
+            return self.automation_priority or self.clock() - self.last_external_input >= self.idle_seconds
+
+    def observe_keyboard(self, extra_info, target_foreground=True):
+        with self.lock:
+            if extra_info != self.own_tag:
+                self.last_external_input = self.clock()
+                if self.automation_priority or self.region is not None and not target_foreground:
+                    self.outside_events += 1
+                    return False
+            return self.observe('keyboard', extra_info)
 
     def observe_pointer(self, kind, position, extra_info):
         with self.lock:
             previous = self._last_pointer
             self._last_pointer = position
-            # RDP may echo a cursor-position notification after our own move.
-            # A zero-displacement move is not a takeover. Never suppress
-            # buttons, wheels, or an actual one-pixel position change.
             if kind == 'mouse_move' and previous == position and extra_info != self.own_tag:
                 self.duplicate_pointer_notifications += 1
                 return False
+            if extra_info != self.own_tag:
+                self.last_external_input = self.clock()
+                if self.automation_priority:
+                    self.outside_events += 1
+                    return False
+                if self.region is not None:
+                    left, top, right, bottom = self.region
+                    if not (left <= position[0] < right and top <= position[1] < bottom):
+                        self.outside_events += 1
+                        return False
+            # RDP may echo a cursor-position notification after our own move.
+            # A zero-displacement move is not a takeover. Never suppress
+            # buttons, wheels, or an actual one-pixel position change.
             return self.observe('mouse' if kind == 'mouse_move' else kind, extra_info)
 
     def observe(self, kind, extra_info):
@@ -47,6 +83,7 @@ class InputArbiter:
                 self.own_events += 1
                 return False
             self.generation += 1
+            self.last_external_input = self.clock()
             self.last_human = self.clock()
             self.interrupted = True
             self.reason = kind
@@ -80,6 +117,14 @@ class InputArbiter:
             return {'paused': self.interrupted or not self.armed, 'generation': self.generation,
                     'reason': self.reason, 'idle_remaining_seconds': max(0, self.idle_seconds - (self.clock() - self.last_human)),
                     'own_events': self.own_events}
+
+
+class ClipboardChanged(ActionDeferred):
+    """Paste was deferred before any text was entered."""
+
+
+class DraftVerificationFailed(ActionDeferred):
+    """The draft needs review and the send button was never clicked."""
 
 
 def interrupted_send_state(backend):

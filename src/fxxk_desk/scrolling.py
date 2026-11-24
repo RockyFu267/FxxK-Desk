@@ -4,6 +4,10 @@ import math
 import time
 
 
+class ScrollFeedbackUncertain(RuntimeError):
+    """Pixel speed is uncertain; fresh OCR anchors may still verify the page."""
+
+
 @dataclass
 class ScrollProfile:
     pixels_per_event: float | None = None
@@ -39,7 +43,7 @@ def vertical_motion(before, after, direction):
     limit = int(before.shape[0] * 0.45)
     template = before[:-limit] if direction == 'up' else before[limit:]
     if np.std(template) < 0.001:
-        raise RuntimeError('Pixel scroll template has no recognizable content')
+        raise ScrollFeedbackUncertain('Pixel scroll template has no recognizable content')
     # Match only the actual overlapping pixels, rather than periodic FFT
     # correlation. Repeated message layouts otherwise alias a large movement
     # to a shorter distance even when their unique marker lines are visible.
@@ -49,7 +53,7 @@ def vertical_motion(before, after, direction):
     competing = scores.copy()
     competing[max(0, best - 3):best + 4] = -1
     if not math.isfinite(confidence) or confidence < 0.995 or float(np.max(competing)) >= confidence - 0.0001:
-        raise RuntimeError('Pixel scroll feedback uncertain; calibration invalidated')
+        raise ScrollFeedbackUncertain('Pixel scroll feedback uncertain; calibration invalidated')
     return float(best if direction == 'up' else limit - best)
 
 

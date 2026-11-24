@@ -11,6 +11,8 @@ from .interference import UserInterference, interrupted_send_state
 
 def fingerprint(message):
     fields = {key: message.get(key) for key in ("text", "sender", "direction", "complete")}
+    if message.get('visible_time_label'):
+        fields['visible_time_label'] = message['visible_time_label']
     for key in ("text", "sender"):
         if isinstance(fields[key], str):
             fields[key] = "".join(fields[key].split())
@@ -79,7 +81,19 @@ class Workflow:
 
     def _collect_backfill(self):
         from .backfill import Backfill, Page
+        self.db.execute('CREATE TABLE IF NOT EXISTS deferred_tail(scope TEXT PRIMARY KEY)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS stitched_views(scope TEXT PRIMARY KEY, image_hash TEXT)')
+        timestamp_mode = getattr(type(self.backend), 'supports_timestamp_anchor', False)
+        if timestamp_mode:
+            self.db.execute('CREATE TABLE IF NOT EXISTS timestamp_anchors(scope TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        history_gap = '' if timestamp_mode else getattr(self.backend, 'history_gap', '')
+        passive = getattr(self.backend, 'passive_observation', False) or getattr(self.backend, 'defer_history', False) or bool(history_gap)
         open_target(self.target, self.backend)
+        if (not getattr(self.backend, 'passive_observation', False)
+                and getattr(type(self.backend), 'return_to_latest', None)):
+            self.backend.return_to_latest(verify=False)
+        if not timestamp_mode and getattr(type(self.backend), 'jump_to_visible_new_messages', None):
+            self.backend.jump_to_visible_new_messages()
         previous = self.db.execute("SELECT * FROM snapshots WHERE scope=?", (self.scope,)).fetchone()
         version = getattr(type(self.gateway), "extractor_version", "vision-v1")
 
@@ -91,19 +105,42 @@ class Workflow:
         # Avoid OCR on an unchanged committed latest screenshot.
         path = self.backend.message_snapshot(self.target.chat)
         digest = hashlib.sha256(Path(path).read_bytes() + version.encode()).hexdigest()
-        if previous and previous["image_hash"] == digest:
-            return {"status": "unchanged", "new_messages": 0, "coverage": "visible_with_backfill", "caught_up": True}
+        deferred = self.db.execute('SELECT 1 FROM deferred_tail WHERE scope=?', (self.scope,)).fetchone()
+        stitched = self.db.execute('SELECT 1 FROM stitched_views WHERE scope=? AND image_hash=?', (self.scope, digest)).fetchone()
+        if not timestamp_mode and previous and previous["image_hash"] == digest and (passive or not deferred or stitched):
+            return {"status": "unchanged", "new_messages": 0, "coverage": "visible_with_backfill", "caught_up": not passive and not bool(deferred)}
         initial = Page(self.gateway.extract_messages(path), str(path), digest)
         old_keys = ([fingerprint(json.loads(key)) for key in json.loads(previous["messages"])
                      if json.loads(key).get("complete")] if previous else [])
-        engine = Backfill(read_page, self.backend.scroll_chat, fingerprint,
-                          self.target.backfill_max_pages, self.target.backfill_max_seconds,
-                          self.target.anchor_messages)
-        recovered = engine.recover(old_keys, initial, had_checkpoint=previous is not None)
+        if timestamp_mode:
+            from .timestamp_backfill import TimestampBackfill
+            saved = self.db.execute('SELECT payload FROM timestamp_anchors WHERE scope=?', (self.scope,)).fetchone()
+            anchor = json.loads(saved['payload']) if saved else None
+            legacy_anchor = json.loads(old_keys[-1]) if not anchor and old_keys else None
+            engine = TimestampBackfill(read_page, self.backend.scroll_chat, self.backend.reveal_message_time, fingerprint,
+                                       self.target.backfill_max_pages, self.target.backfill_max_seconds)
+            recovered = engine.recover(initial, anchor, legacy_anchor,
+                                       had_checkpoint=previous is not None, passive=passive)
+        else:
+            engine = Backfill(read_page, self.backend.scroll_chat, fingerprint,
+                              self.target.backfill_max_pages, self.target.backfill_max_seconds, 5)
+            recovered = engine.recover(old_keys, initial, had_checkpoint=previous is not None, passive=passive)
+        if not timestamp_mode and recovered.status == 'gap' and not passive and recovered.reason.startswith(('fragment_', 'ambiguous_fragment_', 'long_message_')):
+            self.backend.history_gap = recovered.reason
+        if history_gap and recovered.status == 'gap':
+            recovered.reason = 'history_retry_paused: '+history_gap
         self._check_context()
         now = datetime.now(timezone.utc).isoformat()
         continuous = recovered.status in ("overlap", "recovered")
         with self.db:
+            if any(message.get('source') == 'stitched_local_ocr' for message in recovered.checkpoint):
+                self.db.execute('INSERT OR REPLACE INTO stitched_views VALUES(?,?)', (self.scope, recovered.image_hash))
+            elif recovered.checkpoint:
+                self.db.execute('DELETE FROM stitched_views WHERE scope=?', (self.scope,))
+            if not recovered.caught_up and recovered.checkpoint:
+                self.db.execute('INSERT OR IGNORE INTO deferred_tail VALUES(?)', (self.scope,))
+            elif recovered.caught_up:
+                self.db.execute('DELETE FROM deferred_tail WHERE scope=?', (self.scope,))
             for page in recovered.pages:
                 self.db.execute("INSERT INTO capture_pages(scope,observed_at,image_hash,screenshot,messages) VALUES(?,?,?,?,?)",
                                 (self.scope, now, page.image_hash, page.screenshot, json.dumps(page.messages, ensure_ascii=False)))
@@ -114,8 +151,11 @@ class Workflow:
                     self.db.execute("INSERT INTO messages(scope,observed_at,payload,screenshot,eligible,continuity_verified) VALUES(?,?,?,?,?,?)",
                                     (self.scope, now, json.dumps(payload, ensure_ascii=False), message["_screenshot"],
                                      int(continuous and message["direction"] == "incoming" and message["complete"]), int(continuous)))
-                keys = [fingerprint(m) for m in recovered.checkpoint][-32:]
+                keys = [fingerprint(m) for m in recovered.checkpoint if m.get('complete')][-(1 if timestamp_mode else 5):]
                 self.db.execute("INSERT OR REPLACE INTO snapshots VALUES(?,?,?)", (self.scope, recovered.image_hash, json.dumps(keys)))
+                if recovered.anchor:
+                    self.db.execute('INSERT OR REPLACE INTO timestamp_anchors VALUES(?,?)',
+                                    (self.scope, json.dumps(recovered.anchor, ensure_ascii=False)))
             gap = self.db.execute("SELECT id FROM collection_gaps WHERE scope=? AND resolved_at IS NULL ORDER BY id DESC LIMIT 1", (self.scope,)).fetchone()
             if recovered.caught_up:
                 self.db.execute("UPDATE collection_gaps SET resolved_at=? WHERE scope=? AND resolved_at IS NULL", (now, self.scope))
@@ -135,7 +175,8 @@ class Workflow:
         digest = hashlib.sha256(Path(path).read_bytes() + extractor_version.encode()).hexdigest()
         previous = self.db.execute("SELECT * FROM snapshots WHERE scope=?", (self.scope,)).fetchone()
         if previous and previous["image_hash"] == digest:
-            return {"status": "unchanged", "new_messages": 0, "coverage": "visible_only"}
+            return {"status": "unchanged", "new_messages": 0, "coverage": "visible_only",
+                    "caught_up": not getattr(self.backend, 'passive_observation', False)}
         current = self.gateway.extract_messages(path)
         keys = [fingerprint(m) for m in current]
         old_keys = [fingerprint(json.loads(key)) for key in json.loads(previous["messages"])] if previous else []
@@ -157,7 +198,8 @@ class Workflow:
                                 (self.scope, now, json.dumps(message, ensure_ascii=False), str(path), int(eligible), int(continuous)))
             self.db.execute("INSERT OR REPLACE INTO snapshots VALUES(?,?,?)", (self.scope, digest, json.dumps(keys)))
         return {"status": "observed", "new_messages": len(current) - count,
-                "coverage": "visible_only", "continuity": "overlap" if continuous else "baseline_or_gap"}
+                "coverage": "visible_only", "continuity": "overlap" if continuous else "baseline_or_gap",
+                "caught_up": not getattr(self.backend, 'passive_observation', False)}
 
     def draft(self, instruction):
         # One draft at a time; no background queue drains or historical bulk replies.

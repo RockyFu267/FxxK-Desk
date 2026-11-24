@@ -4,8 +4,9 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
-from fxxk_desk.relay import Relay, RelayModels, SummaryWorker
+from fxxk_desk.relay import Relay, RelayModels, SummaryWorker, ready_for_delivery, source_chat_cycle
 from fxxk_desk.targets import Target
 from fxxk_desk.workflow import Workflow
 from fxxk_desk.interference import UserInterference
@@ -16,6 +17,98 @@ def message(text, sender="Alice", direction="incoming"):
 
 
 class RelayTests(unittest.TestCase):
+    def test_long_original_bypasses_model_and_sends_full_text_once(self):
+        body = ''.join(f'Original row {i} with details\n' for i in range(32))
+        self.collect([message('old')], b'first')
+        self.collect([message('old'), message(body)], b'second')
+        draft = self.relay.drafts()[0]
+        self.gateway.reply.assert_not_called()
+        with patch('fxxk_desk.relay.open_target'):
+            sent = self.relay.send(draft['id'])
+        parts = [call.args[1] for call in self.backend.send_reply.call_args_list]
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].split('\n', 1)[1], body)
+        self.assertEqual(sent['state'], 'sent')
+        self.assertEqual(self.source.db.execute('SELECT next_part FROM relay_outbox').fetchone()[0], len(parts))
+
+    def test_legacy_partial_delivery_keeps_numbered_boundaries(self):
+        body = ''.join(f'Original row {i} with details\n' for i in range(32))
+        item = message(body)
+        self.collect([message('old')], b'first')
+        self.collect([message('old'), item], b'second')
+        draft = self.relay.drafts()[0]
+        expected = self.relay.original_parts(item, draft['id'], 'Alice', legacy=True)
+        self.assertGreater(len(expected), 1)
+        with self.source.db:
+            self.source.db.execute('UPDATE relay_outbox SET next_part=1,delivery_format=NULL,text=? WHERE id=?',
+                                   (expected[0], draft['id']))
+        with patch('fxxk_desk.relay.open_target'):
+            self.relay.send(draft['id'])
+        self.assertEqual([call.args[1] for call in self.backend.send_reply.call_args_list], expected[1:])
+
+    def test_cycle_restores_source_even_when_delivery_branch_continues(self):
+        events = []
+        source = object()
+
+        class Desktop:
+            passive_observation = False
+
+            def return_to_latest(self):
+                events.append('latest')
+
+        backend = Desktop()
+        with patch('fxxk_desk.relay.open_target', side_effect=lambda target, _: events.append(target)):
+            for _ in range(1):
+                with source_chat_cycle(backend, source, None) as cycle:
+                    cycle['restore'] = True
+                    events.append('destination')
+                    continue
+        self.assertEqual(events, ['destination', source, 'latest'])
+
+    def test_cycle_does_not_move_mouse_after_interruption(self):
+        class Desktop:
+            passive_observation = False
+
+            def return_to_latest(self):
+                pass
+
+        with patch('fxxk_desk.relay.open_target') as open_chat:
+            with self.assertRaises(UserInterference):
+                with source_chat_cycle(Desktop(), object(), None):
+                    raise UserInterference('interrupted')
+            open_chat.assert_not_called()
+
+    def test_summary_receives_chat_content_without_capture_metadata(self):
+        gateway = Mock()
+        models = RelayModels(Mock(), gateway)
+        models.reply(dict(message('hello'), bubble_rect=[1, 2, 3, 4], ocr_confidence=.99), 'summarize')
+        gateway.reply.assert_called_once_with({'text': 'hello', 'sender': 'Alice', 'direction': 'incoming'}, 'summarize')
+
+    def test_committed_capture_is_enqueued_without_recapturing(self):
+        self.collect([message('old')], b'first')
+        self.image.write_bytes(b'second')
+        self.gateway.extract_messages.return_value = [message('old'), message('new')]
+        self.source.collect()
+        with patch.object(self.source, 'collect', side_effect=AssertionError('must not recapture')):
+            self.assertEqual(self.relay.enqueue_captured()['relay_queued'], 1)
+        self.assertEqual(len(self.relay.drafts()), 1)
+
+    def test_test_delivery_allowlist_excludes_unrelated_drafts(self):
+        self.collect([message('old')], b'first')
+        self.collect([message('old'), message('test FD-abcdef1234-1'), message('unrelated')], b'second')
+        self.relay.drafts()
+        drafts = ready_for_delivery(self.relay, SimpleNamespace(send_markers=['FD-abcdef1234-1']))
+        self.assertEqual(len(drafts), 1)
+        payload = self.source.db.execute('SELECT m.payload FROM messages m JOIN relay_outbox o ON o.source_id=m.id WHERE o.id=?', (drafts[0]['id'],)).fetchone()[0]
+        self.assertIn('FD-abcdef1234-1', payload)
+
+    def test_uncertain_marker_summary_never_invents_damaged_body(self):
+        gateway = Mock()
+        models = RelayModels(Mock(), gateway)
+        result = models.reply(dict(message('识别不确定 FD-abcdef1234-2'), source='ocr_uncertain_marker'), 'summary')
+        self.assertIn('FD-abcdef1234-2', result)
+        self.assertIn('识别不确定', result)
+        gateway.reply.assert_not_called()
     def assert_interrupted_phase(self, phase, expected):
         self.queue()
         draft = self.relay.drafts()[0]

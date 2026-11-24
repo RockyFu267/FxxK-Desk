@@ -83,7 +83,12 @@ class Desktop:
         if self.input_guard:
             self.input_guard()
         if self.u.GetForegroundWindow() != window.id:
-            raise RuntimeError("Windows denied foreground activation; select the window manually")
+            fallback = getattr(self, 'foreground_fallback', None)
+            if fallback:
+                fallback(window)
+            if self.u.GetForegroundWindow() != window.id:
+                from .interference import ActionDeferred
+                raise ActionDeferred('无法取得目标软件焦点，本轮自动操作暂缓')
 
     def launch(self, executable):
         if self.input_guard:

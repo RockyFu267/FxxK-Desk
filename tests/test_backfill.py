@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from fxxk_desk.backfill import Backfill, Page, find_anchor
+from fxxk_desk.backfill import Backfill, Page, find_anchor, find_identified_anchor
 from fxxk_desk.targets import Target
 from fxxk_desk.workflow import Workflow, fingerprint
 from fxxk_desk.interference import UserInterference
@@ -62,6 +62,87 @@ class Reader:
 
 
 class BackfillTests(unittest.TestCase):
+    def test_checkpoint_requires_all_five_in_order(self):
+        previous = ['older', 'a', 'b', 'c', 'd', 'e']
+        self.assertEqual(find_anchor(previous, ['a', 'b', 'c', 'd', 'e', 'new']), 5)
+        self.assertIsNone(find_anchor(previous, ['x', 'b', 'c', 'd', 'e', 'new']))
+        self.assertIsNone(find_anchor(previous, ['a', 'c', 'b', 'd', 'e']))
+        self.assertEqual(find_anchor(['a', 'b'], ['a', 'b', 'new']), 2)
+
+    def test_same_sender_and_text_at_a_later_visible_time_is_new(self):
+        earlier = dict(msg(1), visible_time_label='11:10')
+        later = dict(earlier, visible_time_label='11:12')
+        previous = [msg(0), earlier]
+        page = Page(previous + [later, later], 'current.png', 'current')
+        capture = Backfill(lambda: self.fail('unexpected capture'),
+                           lambda *args: self.fail('unexpected scroll'), fingerprint)
+        result = capture.recover([fingerprint(item) for item in previous], page, had_checkpoint=True)
+        self.assertEqual([fingerprint(item) for item in result.messages], [fingerprint(later)] * 2)
+
+    def test_explicit_event_anchor_can_verify_prefix_when_previous_message_is_clipped(self):
+        previous = [fingerprint(msg(1)), fingerprint(dict(msg(2), text='测试事件 SCROLL-7c78f4-08'))]
+        current = [previous[-1], fingerprint(msg(3)), fingerprint(msg(4))]
+        self.assertEqual(find_identified_anchor(previous, current), 1)
+        self.assertIsNone(find_identified_anchor(previous, [previous[-1], previous[-1], current[-1]]))
+        self.assertIsNone(find_identified_anchor([fingerprint(msg(1)), fingerprint(msg(2))], [fingerprint(msg(2)), fingerprint(msg(3))]))
+    def test_visible_new_messages_are_returned_before_any_scroll(self):
+        desktop = Transcript([msg(i) for i in range(16)])
+        result = Backfill(desktop.read, desktop.scroll, fingerprint).recover(
+            [fingerprint(msg(i)) for i in range(12)], desktop.read(), had_checkpoint=True)
+        self.assertEqual([m['text'] for m in result.messages], [msg(i)['text'] for i in range(12,16)])
+        self.assertEqual(desktop.moves, [])
+        self.assertFalse(result.caught_up)
+
+    def test_uncertain_pixel_speed_still_reads_page_and_proves_ocr_overlap(self):
+        from fxxk_desk.scrolling import ScrollFeedbackUncertain
+        desktop = Transcript([msg(i) for i in range(64)])
+        def uncertain_scroll(direction, fast=False):
+            desktop.scroll(direction, fast)
+            raise ScrollFeedbackUncertain('speed uncertain')
+        result = Backfill(desktop.read, uncertain_scroll, fingerprint).recover(
+            [fingerprint(msg(i)) for i in range(12)], desktop.read(), had_checkpoint=True)
+        self.assertTrue(result.caught_up, result.reason)
+        self.assertEqual([m['text'] for m in result.messages], [msg(i)['text'] for i in range(12,64)])
+    def test_passive_prefix_collection_does_not_scroll_or_claim_latest(self):
+        desktop = Transcript([msg(i) for i in range(16)])
+        result = Backfill(desktop.read, desktop.scroll, fingerprint).recover(
+            [fingerprint(msg(i)) for i in range(12)], desktop.read(), had_checkpoint=True, passive=True)
+        self.assertEqual([m['text'] for m in result.messages], [msg(i)['text'] for i in range(12, 16)])
+        self.assertEqual(result.status, 'overlap')
+        self.assertFalse(result.caught_up)
+        self.assertEqual(desktop.moves, [])
+
+    def test_passive_missing_anchor_preserves_checkpoint_and_waits(self):
+        desktop = Transcript([msg(i) for i in range(100, 160)])
+        result = Backfill(desktop.read, desktop.scroll, fingerprint).recover(
+            [fingerprint(msg(i)) for i in range(12)], desktop.read(), had_checkpoint=True, passive=True)
+        self.assertFalse(result.checkpoint)
+        self.assertFalse(result.messages)
+        self.assertFalse(result.caught_up)
+        self.assertEqual(desktop.moves, [])
+
+    def test_matching_visible_tail_finishes_without_probe_scroll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            desktop = Transcript([msg(i) for i in range(12)], directory=directory)
+            target = Target('app.exe', 'App', 'Group')
+            workflow = Workflow('group', target, desktop, Reader(), str(Path(directory) / 'chat.db'))
+            try:
+                self.assertTrue(workflow.collect()['caught_up'])
+                desktop.moves.clear()
+                desktop.items.extend([msg(12), msg(13)])
+                desktop.position = 2
+                desktop.passive_observation = True
+                result = workflow.collect()
+                self.assertEqual(result['new_messages'], 2)
+                self.assertFalse(result['caught_up'])
+                self.assertEqual(desktop.moves, [])
+                self.assertFalse(workflow.collect()['caught_up'])
+                desktop.passive_observation = False
+                self.assertTrue(workflow.collect()['caught_up'])
+                self.assertEqual(desktop.moves, [])
+                self.assertFalse(workflow.db.execute('SELECT 1 FROM deferred_tail').fetchone())
+            finally:
+                workflow.close()
     def test_user_interruption_does_not_trigger_restore_scroll(self):
         desktop = Transcript([msg(i) for i in range(60)])
 

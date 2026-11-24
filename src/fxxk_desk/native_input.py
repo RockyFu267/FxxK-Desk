@@ -8,8 +8,9 @@ from ctypes import wintypes
 import os
 import threading
 import time
+from contextlib import contextmanager
 
-from .interference import UserInterference, DesktopUnavailable
+from .interference import ClipboardChanged, UserInterference, DesktopUnavailable
 
 
 ULONG_PTR = ctypes.c_size_t
@@ -55,9 +56,11 @@ class InputMonitor:
             raise RuntimeError('Native input monitoring requires Windows')
         self.arbiter = arbiter
         self.user = ctypes.WinDLL('user32', use_last_error=True)
+        self.user.GetForegroundWindow.restype = wintypes.HWND
         self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
         self.ready = threading.Event()
         self.failure = None
+        self.target_hwnd = None
         self.thread_id = None
         self.thread = threading.Thread(target=self._run, name='desktop-input-monitor', daemon=True)
 
@@ -75,7 +78,22 @@ class InputMonitor:
     def desktop_available(self):
         point = wintypes.POINT()
         self.user.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-        return bool(self.user.GetCursorPos(ctypes.byref(point)))
+        return bool(self.user.GetCursorPos(ctypes.byref(point))) and self._input_desktop_is_default()
+
+    def _input_desktop_is_default(self):
+        self.user.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.user.OpenInputDesktop.restype = wintypes.HANDLE
+        self.user.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        self.user.CloseDesktop.argtypes = [wintypes.HANDLE]
+        desktop = self.user.OpenInputDesktop(0, False, 1)
+        if not desktop:
+            return False
+        try:
+            name = ctypes.create_unicode_buffer(256)
+            needed = wintypes.DWORD()
+            return bool(self.user.GetUserObjectInformationW(desktop, 2, name, ctypes.sizeof(name), ctypes.byref(needed))) and name.value.casefold() == 'default'
+        finally:
+            self.user.CloseDesktop(desktop)
 
     def require_desktop(self):
         if not self.desktop_available():
@@ -111,7 +129,8 @@ class InputMonitor:
         def keyboard_callback(code, message, pointer):
             if code >= 0:
                 data = ctypes.cast(pointer, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                self.arbiter.observe('keyboard', int(data.dwExtraInfo))
+                self.arbiter.observe_keyboard(int(data.dwExtraInfo),
+                                             target_foreground=not self.target_hwnd or user.GetForegroundWindow() == self.target_hwnd)
             return user.CallNextHookEx(None, code, message, pointer)
 
         try:
@@ -157,11 +176,33 @@ class TaggedInputs:
         self.user.SendInput.restype = wintypes.UINT
         self.user.GetAsyncKeyState.argtypes = [ctypes.c_int]
         self.user.GetAsyncKeyState.restype = wintypes.SHORT
+        self.anchor = None
 
-    def _send(self, records):
+    def park(self):
+        anchor = getattr(self, 'anchor', None)
+        if anchor is not None:
+            self._send([self._move_record(anchor)], expected_after=anchor)
+
+    @contextmanager
+    def step(self):
+        self.park()
+        yield
+        # Do not restore after an interrupted/failed action: context may have
+        # changed or Windows may be locked. The next attempt reinitializes.
+        self.park()
+
+    def _send(self, records, expected_cursor=None, expected_after=None):
         self.monitor.check()
         if getattr(self, 'context_guard', None):
             self.context_guard()
+        if expected_cursor is not None:
+            point = wintypes.POINT()
+            self.user.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+            if not self.user.GetCursorPos(ctypes.byref(point)):
+                raise DesktopUnavailable('Cannot verify pointer position before click')
+            if abs(point.x - expected_cursor[0]) > 2 or abs(point.y - expected_cursor[1]) > 2:
+                from .interference import ActionDeferred
+                raise ActionDeferred('鼠标在点击前偏离目标，重新定位后再试')
         # Do not move the cursor during a human drag or type through held keys.
         if any(self.user.GetAsyncKeyState(key) & 0x8000 for key in (1, 2, 4, 0x10, 0x11, 0x12)):
             self.arbiter.observe('held_button_or_modifier', None)
@@ -174,6 +215,14 @@ class TaggedInputs:
         self.monitor.check()
         if getattr(self, 'context_guard', None):
             self.context_guard()
+        if expected_after is not None:
+            point = wintypes.POINT()
+            self.user.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+            if not self.user.GetCursorPos(ctypes.byref(point)):
+                raise DesktopUnavailable('Cannot verify initialized pointer')
+            if abs(point.x-expected_after[0]) > 2 or abs(point.y-expected_after[1]) > 2:
+                from .interference import ActionDeferred
+                raise ActionDeferred('鼠标初始化位置校验失败，本轮操作已暂缓')
 
     def _mouse(self, flags, data=0, x=0, y=0):
         return INPUT(type=0, mi=MOUSEINPUT(x, y, data & 0xFFFFFFFF, flags, 0, self.arbiter.own_tag))
@@ -191,23 +240,158 @@ class TaggedInputs:
     def move(self, coords):
         self._send([self._move_record(coords)])
 
-    def click(self, coords):
-        self._send([self._move_record(coords), self._mouse(0x0002), self._mouse(0x0004)])
+    def click(self, coords, *, observe=None):
+        with self.step():
+            self._click(coords)
+            if observe is not None:
+                return observe()
+
+    def _click(self, coords):
+        # RDP/mixed-DPI desktops may apply a move after a co-batched button.
+        # Settle and verify the actual pointer before a separate button packet.
+        self.move(coords)
+        time.sleep(0.08)
+        down, up = self._move_record(coords), self._move_record(coords)
+        down.mi.dwFlags |= 0x0002
+        up.mi.dwFlags |= 0x0004
+        self._send([down, up], expected_cursor=coords)
 
     def scroll(self, coords, wheel_dist):
-        self.move(coords)
-        self._send([self._mouse(0x0800, int(wheel_dist * 120))])
+        with self.step():
+            self.move(coords)
+            wheel = self._move_record(coords)
+            wheel.mi.dwFlags |= 0x0800
+            wheel.mi.mouseData = int(wheel_dist * 120) & 0xFFFFFFFF
+            self._send([wheel], expected_cursor=coords)
         # Preserve the previous controller's event pacing while changing tags.
         time.sleep(0.09)
 
     def hotkey(self, *keys):
-        codes = {'ctrl': 0x11, 'f': 0x46}
+        with self.step():
+            self._hotkey(*keys)
+
+    def _hotkey(self, *keys):
+        codes = {'ctrl': 0x11, 'f': 0x46, 'a': 0x41, 'v': 0x56, 'c': 0x43}
         values = [codes[key] for key in keys]
         records = [INPUT(type=1, ki=KEYBDINPUT(code, 0, 0, 0, self.arbiter.own_tag)) for code in values]
         records += [INPUT(type=1, ki=KEYBDINPUT(code, 0, 0x0002, 0, self.arbiter.own_tag)) for code in reversed(values)]
         self._send(records)
 
     def type_text(self, text, pause=0.02):
+        if any(char in text for char in '\r\n\t'):
+            raise ValueError('Control characters require clipboard paste')
+        with self.step():
+            self._type_text(text, pause)
+
+    def paste_text(self, text):
+        """Paste a multiline draft without sending any Enter key events."""
+        from concurrent.futures import ThreadPoolExecutor
+        import win32clipboard as clipboard
+
+        with self.step(), ThreadPoolExecutor(max_workers=1, thread_name_prefix='clipboard-sta') as executor:
+            staged = self._staged_clipboard(text)
+            owned = executor.submit(staged.__enter__).result()
+            try:
+                if clipboard.GetClipboardSequenceNumber() != owned[0]:
+                    raise ClipboardChanged('剪贴板在粘贴前发生变化，本轮暂缓发送')
+                self._hotkey('ctrl', 'v')
+                time.sleep(.35)
+            finally:
+                executor.submit(staged.__exit__, None, None, None).result()
+
+    def read_editor_text(self, verify_focus, expected_pid):
+        """Copy a verified editor selection and read all text, including scrolled lines."""
+        from concurrent.futures import ThreadPoolExecutor
+        from uuid import uuid4
+        import win32clipboard as clipboard
+        import win32process
+
+        with self.step(), ThreadPoolExecutor(max_workers=1, thread_name_prefix='clipboard-sta') as executor:
+            staged = self._staged_clipboard(uuid4().hex)
+            owned = executor.submit(staged.__enter__).result()
+            try:
+                if not verify_focus() or clipboard.GetClipboardSequenceNumber() != owned[0]:
+                    return None
+                self._hotkey('ctrl', 'a')
+                self._hotkey('ctrl', 'c')
+                for _ in range(8):
+                    time.sleep(.05)
+                    if clipboard.GetClipboardSequenceNumber() != owned[0]:
+                        break
+                owner = clipboard.GetClipboardOwner()
+                if not owner or win32process.GetWindowThreadProcessId(owner)[1] != expected_pid:
+                    return None
+                clipboard.OpenClipboard()
+                try:
+                    sequence = clipboard.GetClipboardSequenceNumber()
+                    if sequence == owned[0] or owner != clipboard.GetClipboardOwner():
+                        return None
+                    owned[0] = sequence
+                    if clipboard.IsClipboardFormatAvailable(clipboard.CF_UNICODETEXT):
+                        copied = clipboard.GetClipboardData(clipboard.CF_UNICODETEXT)
+                        owned[0] = clipboard.GetClipboardSequenceNumber()
+                    else:
+                        return None
+                finally:
+                    clipboard.CloseClipboard()
+                return copied
+            finally:
+                executor.submit(staged.__exit__, None, None, None).result()
+
+    @staticmethod
+    @contextmanager
+    def _staged_clipboard(text):
+        import pythoncom
+        import pywintypes
+        import win32clipboard as clipboard
+        import win32gui
+
+        pythoncom.OleInitialize()
+        owned = [None]
+        try:
+            expected = text.replace('\n', '\r\n')
+            foreground = win32gui.GetForegroundWindow()
+            previous_sequence = clipboard.GetClipboardSequenceNumber()
+            previous = pythoncom.OleGetClipboard()
+            clipboard.OpenClipboard(foreground)
+            try:
+                if clipboard.GetClipboardSequenceNumber() != previous_sequence:
+                    raise ClipboardChanged('剪贴板在准备粘贴时发生变化，本轮暂缓发送')
+                clipboard.EmptyClipboard()
+                owned[0] = clipboard.GetClipboardSequenceNumber()
+                clipboard.SetClipboardText(expected, clipboard.CF_UNICODETEXT)
+                owned[0] = clipboard.GetClipboardSequenceNumber()
+            finally:
+                clipboard.CloseClipboard()
+            # Closing the clipboard can publish the write and advance the
+            # sequence. Verify the published payload before recording it.
+            clipboard.OpenClipboard(foreground)
+            try:
+                if (not clipboard.IsClipboardFormatAvailable(clipboard.CF_UNICODETEXT)
+                        or clipboard.GetClipboardData(clipboard.CF_UNICODETEXT) != expected):
+                    raise ClipboardChanged('剪贴板中的正文与待发送内容不一致，本轮暂缓发送')
+                owned[0] = clipboard.GetClipboardSequenceNumber()
+            finally:
+                clipboard.CloseClipboard()
+            yield owned
+        finally:
+            try:
+                for attempt in range(3):
+                    if owned[0] is None or clipboard.GetClipboardSequenceNumber() != owned[0]:
+                        break
+                    try:
+                        pythoncom.OleSetClipboard(previous)
+                        break
+                    except pywintypes.com_error as error:
+                        if attempt == 2:
+                            import logging
+                            logging.getLogger(__name__).warning('无法恢复剪贴板，继续核验已粘贴正文（HRESULT %s）', error.hresult)
+                        else:
+                            time.sleep(.05)
+            finally:
+                ctypes.WinDLL('ole32').OleUninitialize()
+
+    def _type_text(self, text, pause):
         for character in text:
             units = character.encode('utf-16-le')
             records = []

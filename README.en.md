@@ -25,6 +25,8 @@ Keep the core independent of application adapters, process data locally by defau
 
 ## Status
 
+A [visual region editor](docs/region-editor.md) supports moving between monitors, eight resize handles, size limits, and local settings. Capture regions are configured independently from application interaction adapters.
+
 An initial Python scaffold provides window discovery, application launch and focus, screenshot capture, and a configurable vision gateway client. See the [development guide](docs/development.md) for setup. End-to-end visual recognition and action verification still require desktop validation.
 
 An experimental chat and relay workflow adds configured navigation, visible-message collection, SQLite observations, and one-way summaries with sender attribution. The standalone program has completed one desktop relay test; continuous operation and broader message coverage still require validation.
